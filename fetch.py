@@ -1,135 +1,145 @@
-import requests
+from dotenv import load_dotenv
+load_dotenv()
+import os
+import logging
+import time
 from datetime import datetime, timedelta
+
+import requests
 import pandas as pd
 import hopsworks
-import time
-import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+# ─── Configuration ───────────────────────────────────────────────────────────────
+# Load from env; you can use python-dotenv or set in your CI/CD secrets
+OPENWEATHER_API_KEY    = os.environ["OPENWEATHER_API_KEY"]
+HOPSWORKS_API_KEY      = os.environ["HOPSWORKS_API_KEY"]
+HOPSWORKS_HOST         = os.getenv("HOPSWORKS_HOST", "c.app.hopsworks.ai")
+
+LATITUDE               = float(os.getenv("LATITUDE", 33.6995))
+LONGITUDE              = float(os.getenv("LONGITUDE", 73.0363))
+CITY_NAME              = os.getenv("CITY_NAME", "Islamabad")
+
+# How many days back to pull (e.g. 365 for a year)
+BACKFILL_DAYS          = int(os.getenv("BACKFILL_DAYS", 90))
+
+BASE_URL               = "http://api.openweathermap.org/data/2.5/air_pollution/history"
+FEATURESTORE_NAME      = os.getenv("FEATURESTORE_NAME", "aqi_islamabad_featurestore")
+FEATUREGROUP_NAME      = os.getenv("FEATUREGROUP_NAME", "isb_aqi_history")
+FG_VERSION             = int(os.getenv("FG_VERSION", 1))
+
+# ─── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("fetch_aqi.log"),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("fetch_aqi.log")],
 )
 logger = logging.getLogger(__name__)
 
-OPENWEATHERMAP_API_KEY = "bd4f84998dd0e6d4c12ae08ff7d8d0df"
-LAT = 33.6995  # Lahore latitude
-LON = 73.0363  # Lahore longitude
-CITY = "Islamabad"
-BASE_URL = "http://api.openweathermap.org/data/2.5/air_pollution/history"
+# ─── Retry Policies ─────────────────────────────────────────────────────────────
+retry_http = retry(
+    retry=retry_if_exception_type(requests.RequestException),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    reraise=True,
+)
 
-def pm25_to_aqi(pm25):
-    """Convert PM2.5 (µg/m³) to US AQI (0–500)."""
-    try:
-        if 0 <= pm25 <= 12.0:
-            return (50 / 12.0) * pm25
-        elif 12.1 <= pm25 <= 35.4:
-            return ((100 - 51) / (35.4 - 12.1)) * (pm25 - 12.1) + 51
-        elif 35.5 <= pm25 <= 55.4:
-            return ((150 - 101) / (55.4 - 35.5)) * (pm25 - 35.5) + 101
-        elif 55.5 <= pm25 <= 150.4:
-            return ((200 - 151) / (150.4 - 55.5)) * (pm25 - 55.5) + 151
-        elif 150.5 <= pm25 <= 250.4:
-            return ((300 - 201) / (250.4 - 150.5)) * (pm25 - 150.5) + 201
-        elif 250.5 <= pm25 <= 500.4:
-            return ((500 - 301) / (500.4 - 250.5)) * (pm25 - 250.5) + 301
-        else:
-            return 500
-    except Exception as e:
-        logger.error(f"Error converting PM2.5 to AQI: {e}")
-        return 0
+retry_hops = retry(
+    retry=retry_if_exception_type(Exception),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=5, max=60),
+    reraise=True,
+)
 
-def fetch_historical_aqi():
-    logger.info("Fetching 60 days of historical AQI data for %s...", CITY)
-    aqi_data = []
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=90)
+# ─── AQI Breakpoints ────────────────────────────────────────────────────────────
+# Each pollutant’s breakpoints from US EPA; defines (Cp_low, Cp_high, I_low, I_high)
+BREAKPOINTS = {
+    "pm2_5": [(0.0,12.0,0,50),(12.1,35.4,51,100),(35.5,55.4,101,150),
+              (55.5,150.4,151,200),(150.5,250.4,201,300),(250.5,500.4,301,500)],
+    "pm10":  [(0,54,0,50),(55,154,51,100),(155,254,101,150),
+              (255,354,151,200),(355,424,201,300),(425,604,301,500)],
+    "no2":   [(0,53,0,50),(54,100,51,100),(101,360,101,150),
+              (361,649,151,200),(650,1249,201,300),(1250,2049,301,500)],
+    "so2":   [(0,35,0,50),(36,75,51,100),(76,185,101,150),
+              (186,304,151,200),(305,604,201,300),(605,1004,301,500)],
+    "co":    [(0.0,4.4,0,50),(4.5,9.4,51,100),(9.5,12.4,101,150),
+              (12.5,15.4,151,200),(15.5,30.4,201,300),(30.5,50.4,301,500)],
+    "o3":    [(0,54,0,50),(55,70,51,100),(71,85,101,150),
+              (86,105,151,200),(106,200,201,300)],
+    "nh3":   [(0,200,0,50),(201,400,51,100),(401,800,101,150)]
+}
 
-    current_date = start_date
-    while current_date < end_date:
-        start_ts = int(current_date.timestamp())
-        end_ts = int((current_date + timedelta(days=1)).timestamp())
-        url = f"{BASE_URL}?lat={LAT}&lon={LON}&start={start_ts}&end={end_ts}&appid={OPENWEATHERMAP_API_KEY}"
-        
+def compute_individual_aqi(cp: float, breakpoints: list) -> int:
+    for (Cl, Ch, Il, Ih) in breakpoints:
+        if Cl <= cp <= Ch:
+            return int(((Ih-Il)/(Ch-Cl))*(cp-Cl) + Il)
+    return 500
+
+def compute_overall_aqi(row: dict) -> int:
+    aqi_vals = []
+    for pol in ["pm2_5","pm10","no2","so2","co","o3","nh3"]:
+        if pol in row and row[pol] is not None:
+            aqi_vals.append(compute_individual_aqi(row[pol], BREAKPOINTS[pol]))
+    return max(aqi_vals)
+
+# ─── Data Fetching ─────────────────────────────────────────────────────────────
+@retry_http
+def fetch_day_data(start_ts: int, end_ts: int) -> list:
+    url = (f"{BASE_URL}?lat={LATITUDE}&lon={LONGITUDE}"
+           f"&start={start_ts}&end={end_ts}&appid={OPENWEATHER_API_KEY}")
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json().get("list", [])
+
+def fetch_historical() -> pd.DataFrame:
+    logger.info("Backfilling last %d days of AQI data for %s", BACKFILL_DAYS, CITY_NAME)
+    records = []
+    end_dt = datetime.utcnow()
+    start_dt = end_dt - timedelta(days=BACKFILL_DAYS)
+
+    dt = start_dt
+    while dt < end_dt:
+        start_ts, end_ts = int(dt.timestamp()), int((dt + timedelta(days=1)).timestamp())
         try:
-            response = requests.get(url)
-            if response.status_code == 429:
-                logger.warning("Rate limit exceeded. Waiting 60 seconds...")
-                time.sleep(60)
-                response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
-            
-            if "list" in data:
-                for entry in data["list"]:
-                    pm25 = entry["components"]["pm2_5"]
-                    us_aqi = int(pm25_to_aqi(pm25))
-                    aqi_record = {
-                        "city": CITY,
-                        "aqi": us_aqi,
-                        "co": entry["components"]["co"],
-                        "no": entry["components"]["no"],
-                        "no2": entry["components"]["no2"],
-                        "o3": entry["components"]["o3"],
-                        "so2": entry["components"]["so2"],
-                        "pm2_5": pm25,
-                        "pm10": entry["components"]["pm10"],
-                        "nh3": entry["components"]["nh3"],
-                        "timestamp": datetime.utcfromtimestamp(entry["dt"]).strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                    aqi_data.append(aqi_record)
-            else:
-                logger.warning(f"No data returned for {current_date.strftime('%Y-%m-%d')}")
-        except requests.RequestException as e:
-            logger.error(f"Error fetching data for {current_date.strftime('%Y-%m-%d')}: {e}")
-        
-        current_date += timedelta(days=1)
-        time.sleep(1)  # Avoid overwhelming API
-    
-    if not aqi_data:
-        logger.error("No AQI data collected.")
-        raise ValueError("No AQI data collected.")
-    
-    df = pd.DataFrame(aqi_data)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    logger.info(f"Fetched {len(df)} records. AQI range: {df['aqi'].min()} to {df['aqi'].max()}")
-    logger.info(f"Sample data:\n{df[['timestamp', 'aqi', 'pm2_5']].head(5).to_string()}")
+            entries = fetch_day_data(start_ts, end_ts)
+            for e in entries:
+                rec = {"timestamp": datetime.utcfromtimestamp(e["dt"]), "city": CITY_NAME}
+                rec.update(e["components"])
+                rec["aqi"] = compute_overall_aqi(rec)
+                records.append(rec)
+        except Exception as e:
+            logger.warning("Failed to fetch %s: %s", dt.date(), e)
+        dt += timedelta(days=1)
+        time.sleep(0.5)
+
+    if not records:
+        raise RuntimeError("No data fetched at all; aborting.")
+    df = pd.DataFrame(records).sort_values("timestamp")
+    logger.info("Fetched %d records; AQI range [%d, %d]",
+                len(df), df.aqi.min(), df.aqi.max())
     return df
 
-def save_to_hopsworks(df):
-    logger.info("Connecting to Hopsworks...")
-    try:
-        project = hopsworks.login(
-            host="c.app.hopsworks.ai",
-            api_key_value="gLSSl3rhxHuDtcgF.0qpN3LM2nlJREY39NBkp0pUGNg4a4mwh1mfgEZSdvvZ5Vx2i5LdwHOSzVN18Dse9"
-        )
-        fs = project.get_feature_store(name="aqi_islamabad_featurestore")
-        
-        fg = fs.get_or_create_feature_group(
-            name="isb_aqi_history",
-            version=1,
-            primary_key=["timestamp"],
-            description="Historical AQI data for Islamabad",
-            event_time="timestamp"
-        )
-        
-        logger.info("Inserting data into feature group...")
-        fg.insert(df, write_options={"wait_for_job": True})
-        logger.info("Data successfully inserted into Hopsworks.")
-    except Exception as e:
-        logger.error(f"Error saving to Hopsworks: {e}")
-        raise
+# ─── Hopsworks Upload ──────────────────────────────────────────────────────────
+@retry_hops
+def upload_to_hopsworks(df: pd.DataFrame):
+    logger.info("Logging into Hopsworks at %s …", HOPSWORKS_HOST)
+    proj = hopsworks.login(host=HOPSWORKS_HOST, api_key_value=HOPSWORKS_API_KEY)
+    fs   = proj.get_feature_store(name=FEATURESTORE_NAME)
+    fg   = fs.get_or_create_feature_group(
+        name=FEATUREGROUP_NAME,
+        version=FG_VERSION,
+        primary_key=["timestamp"],
+        event_time="timestamp",
+        description="Backfilled, multivariate AQI history for Islamabad"
+    )
+    logger.info("Inserting %d rows into FG %s:v%d …", len(df), FEATUREGROUP_NAME, FG_VERSION)
+    fg.insert(df, write_options={"wait_for_job": True})
+    logger.info("Upload complete.")
 
+# ─── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    try:
-        df = fetch_historical_aqi()
-        save_to_hopsworks(df)
-    except Exception as e:
-        logger.error(f"Main execution failed: {e}")
-        raise
+    df = fetch_historical()
+    upload_to_hopsworks(df)
 
 if __name__ == "__main__":
     main()

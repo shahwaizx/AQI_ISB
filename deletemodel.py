@@ -8,7 +8,7 @@ project = hopsworks.login(
 model_registry = project.get_model_registry()
 
 # Replace with your model's name and version
-model_name = "lahore_aqi_model"
+model_name = "isb_aqi_model"
 model_version = 1  # or whatever version you want to delete
 
 # Get the model
