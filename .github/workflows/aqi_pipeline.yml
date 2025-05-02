@@ -1,0 +1,53 @@
+name: Islamabad‑AQI nightly pipeline
+
+on:
+  schedule:
+    # runs every day at 01:00 PKT (20:00 UTC)
+    - cron:  '0 20 * * *'
+  workflow_dispatch:      # enables the “Run workflow” button
+
+jobs:
+  build-train-register:
+    runs-on: ubuntu-latest
+
+    env:                      # secrets + constants exposed to Python
+      OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+      HOPSWORKS_API_KEY:   ${{ secrets.HOPSWORKS_API_KEY }}
+      FG_VERSION:          "10"               # must match fetch/train
+      HOPSWORKS_HOST:      c.app.hopsworks.ai
+      FEATURESTORE_NAME:   aqi_islamabad_featurestore
+      FEATUREGROUP_NAME:   isb_aqi_history
+      MODEL_REGISTRY_NAME: isb_aqi_model
+      LATITUDE:            "33.6995"
+      LONGITUDE:           "73.0363"
+      CITY_NAME:           Islamabad
+      BACKFILL_DAYS:       "365"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run fetch.py (populate feature group)
+      run: python fetch.py
+
+    - name: Run trainmodel.py (train & register model)
+      run: python trainmodel.py
+
+    # optional – keep the model bundle as a CI artifact
+    - name: Upload model bundle
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: isb_aqi_model_bundle
+        path: isb_aqi_model_dir/
+        retention-days: 14
