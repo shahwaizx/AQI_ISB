@@ -43,11 +43,4 @@ jobs:
     - name: Run trainmodel.py (train & register model)
       run: python trainmodel.py
 
-    # optional – keep the model bundle as a CI artifact
-    - name: Upload model bundle
-      uses: actions/upload-artifact@v3
-      if: always()
-      with:
-        name: isb_aqi_model_bundle
-        path: isb_aqi_model_dir/
-        retention-days: 14
+    
